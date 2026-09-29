@@ -1,0 +1,27 @@
+Query
+  │
+  ├─► Query Expansion (agri dictionary)
+  │         │
+  │         ├─► BM25 Lexical Search ────────┐
+  │         │                                 │
+  │         └─► HyDE passage                  │
+  │                   │                       │
+  │                   └─► Dense Retrieval     │
+  │                         (BGE-large)       │
+  │                               │           │
+  │                               └────┬────┘
+  │                                    ▼
+  │                         Reciprocal Rank Fusion
+  │                                    │
+  │                                    ▼
+  │                         Top-30 candidates
+  │                                    │
+  │                                    ▼
+  │              Dual Cross-Encoder Reranking
+  │              (BGE-reranker + mxbai-rerank)
+  │                                    │
+  │                                    ▼
+  │                         Score Ensemble
+  │                                    │
+  │                                    ▼
+  └──────────────────────────► Final Top-10 Documents
