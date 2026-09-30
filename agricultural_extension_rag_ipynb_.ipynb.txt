@@ -1,0 +1,384 @@
+{
+  "nbformat": 4,
+  "nbformat_minor": 0,
+  "metadata": {
+    "colab": {
+      "provenance": []
+    },
+    "kernelspec": {
+      "name": "python3",
+      "display_name": "Python 3"
+    },
+    "language_info": {
+      "name": "python"
+    }
+  },
+  "cells": [
+    {
+      "cell_type": "code",
+      "execution_count": null,
+      "metadata": {
+        "id": "t5ZAa4aijvAt"
+      },
+      "outputs": [],
+      "source": []
+    },
+    {
+      "cell_type": "markdown",
+      "source": [
+        "# Agricultural Extension RAG – Smart Retrieval for Farmers\n",
+        "\n",
+        "**Team Tsavo** · TRI AI Saturday Cohort 10 (AI Research Foundations with Google DeepMind)  \n",
+        "**Result:** 9th out of 25 teams\n",
+        "\n",
+        "## Problem\n",
+        "Retrieve the most relevant agricultural-extension documents for natural-language queries from farmers and extension officers.\n",
+        "\n",
+        "## Pipeline\n",
+        "1. Agricultural query expansion  \n",
+        "2. HyDE (hypothetical document)  \n",
+        "3. BM25 lexical retrieval  \n",
+        "4. Dense retrieval (BGE-large)  \n",
+        "5. Reciprocal Rank Fusion  \n",
+        "6. Dual cross-encoder reranking → Top-10 documents"
+      ],
+      "metadata": {
+        "id": "CHcvc9_bjyce"
+      }
+    },
+    {
+      "cell_type": "markdown",
+      "source": [],
+      "metadata": {
+        "id": "FCafFj3dkZUB"
+      }
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "# Uncomment if running outside an environment that already has these packages\n",
+        "# !pip install -q sentence-transformers torch pandas numpy"
+      ],
+      "metadata": {
+        "id": "pZ6DmJhPkZuk"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "import os\n",
+        "import re\n",
+        "import math\n",
+        "import gc\n",
+        "from collections import Counter\n",
+        "\n",
+        "import numpy as np\n",
+        "import pandas as pd\n",
+        "import torch\n",
+        "from sentence_transformers import SentenceTransformer, CrossEncoder\n",
+        "\n",
+        "device = \"cuda\" if torch.cuda.is_available() else \"cpu\"\n",
+        "print(f\"Running on: {device}\")"
+      ],
+      "metadata": {
+        "id": "YbDrqujDkmcU"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "\n",
+        "class BM25Okapi:\n",
+        "    def __init__(self, corpus, k1=1.5, b=0.75):\n",
+        "        self.k1 = k1\n",
+        "        self.b = b\n",
+        "        self.corpus_size = len(corpus)\n",
+        "        self.avgdl = sum(len(doc) for doc in corpus) / self.corpus_size if self.corpus_size else 0\n",
+        "        self.doc_freqs = []\n",
+        "        self.idf = {}\n",
+        "        self.doc_len = []\n",
+        "\n",
+        "        df = Counter()\n",
+        "        for doc in corpus:\n",
+        "            self.doc_len.append(len(doc))\n",
+        "            frequencies = Counter(doc)\n",
+        "            self.doc_freqs.append(frequencies)\n",
+        "            for word in frequencies:\n",
+        "                df[word] += 1\n",
+        "\n",
+        "        for word, freq in df.items():\n",
+        "            self.idf[word] = math.log((self.corpus_size - freq + 0.5) / (freq + 0.5) + 1)\n",
+        "\n",
+        "    def get_scores(self, query):\n",
+        "        scores = [0.0] * self.corpus_size\n",
+        "        for word in query:\n",
+        "            if word not in self.idf:\n",
+        "                continue\n",
+        "            idf = self.idf[word]\n",
+        "            for i, doc_freqs in enumerate(self.doc_freqs):\n",
+        "                if word in doc_freqs:\n",
+        "                    freq = doc_freqs[word]\n",
+        "                    numerator = idf * freq * (self.k1 + 1)\n",
+        "                    denominator = freq + self.k1 * (1 - self.b + self.b * (self.doc_len[i] / self.avgdl))\n",
+        "                    scores[i] += numerator / denominator\n",
+        "        return scores"
+      ],
+      "metadata": {
+        "id": "EqWYkg9ZkuiL"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "\n",
+        "AGRI_DICTIONARY = {\n",
+        "    \"yellow\": \"chlorosis leaf yellowing nutrient deficiency nitrogen\",\n",
+        "    \"spots\": \"lesions leaf spot fungal blight leaf disease\",\n",
+        "    \"curling\": \"leaf curl viral infection aphids drought stress\",\n",
+        "    \"rot\": \"root rot stalk rot dampening off decay bacterial softness\",\n",
+        "    \"bugs\": \"pests insects fall armyworm stem borer whiteflies vector\",\n",
+        "    \"maize\": \"corn zea mays cereal grain crop\",\n",
+        "    \"cassava\": \"manihot esculenta tuber cassava mosaic virus\",\n",
+        "    \"rice\": \"paddy oryza sativa blast disease panicle\",\n",
+        "    \"fertilizer\": \"NPK urea nitrogen phosphorus potassium soil amendment\",\n",
+        "    \"water\": \"irrigation drought moisture stress rainfall deficit\",\n",
+        "}\n",
+        "\n",
+        "def expand_agri_query(query: str) -> str:\n",
+        "    tokens = re.findall(r\"\\b\\w+\\b\", query.lower())\n",
+        "    expanded = set(tokens)\n",
+        "    for token in tokens:\n",
+        "        if token in AGRI_DICTIONARY:\n",
+        "            expanded.update(AGRI_DICTIONARY[token].split())\n",
+        "    return \" \".join(expanded)\n",
+        "\n",
+        "def generate_hyde_doc(query: str, expanded_query: str) -> str:\n",
+        "    return (\n",
+        "        f\"Technical Agricultural Extension Guide regarding {query}.\\n\"\n",
+        "        f\"Diagnosis and Management Key Terms: {expanded_query}.\\n\"\n",
+        "        f\"Recommended agronomic practices include crop monitoring, proper soil nutrient management, \"\n",
+        "        f\"pest control protocols, and application of recommended treatments for affected crops.\"\n",
+        "    )"
+      ],
+      "metadata": {
+        "id": "PTj1589UlGK2"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "\n",
+        "# Update these paths if your files live elsewhere\n",
+        "DOC_PATH = \"documents.csv\"          # or the competition path\n",
+        "TEST_PATH = \"test_queries.csv\"\n",
+        "\n",
+        "documents_df = pd.read_csv(DOC_PATH)\n",
+        "test_queries_df = pd.read_csv(TEST_PATH)\n",
+        "\n",
+        "doc_id_col = next(c for c in documents_df.columns if \"doc\" in c.lower() and \"id\" in c.lower())\n",
+        "doc_text_col = next(\n",
+        "    c for c in documents_df.columns\n",
+        "    if c.lower() in [\"text\", \"content\", \"document\", \"body\"] or \"text\" in c.lower()\n",
+        ")\n",
+        "query_id_col = next(c for c in test_queries_df.columns if \"query\" in c.lower() and \"id\" in c.lower())\n",
+        "query_text_col = next(\n",
+        "    c for c in test_queries_df.columns\n",
+        "    if c.lower() in [\"query\", \"text\", \"question\"] or \"query\" in c.lower()\n",
+        ")\n",
+        "\n",
+        "doc_texts = documents_df[doc_text_col].fillna(\"\").astype(str).tolist()\n",
+        "print(f\"Documents: {len(documents_df)} | Test queries: {len(test_queries_df)}\")"
+      ],
+      "metadata": {
+        "id": "k8Sc46MqlGtU"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "\n",
+        "# Lexical index\n",
+        "tokenized_corpus = [doc.lower().split() for doc in doc_texts]\n",
+        "bm25_index = BM25Okapi(tokenized_corpus)\n",
+        "\n",
+        "# Dense retriever + rerankers\n",
+        "retriever = SentenceTransformer(\"BAAI/bge-large-en-v1.5\", device=device)\n",
+        "reranker_bge = CrossEncoder(\"BAAI/bge-reranker-v2-m3\", device=device)\n",
+        "reranker_mxbai = CrossEncoder(\"mixedbread-ai/mxbai-rerank-large-v1\", device=device)\n",
+        "\n",
+        "# Document embeddings\n",
+        "with torch.autocast(device_type=device, dtype=torch.float16 if device == \"cuda\" else torch.float32):\n",
+        "    doc_embeddings = retriever.encode(\n",
+        "        doc_texts,\n",
+        "        batch_size=32 if device == \"cuda\" else 16,\n",
+        "        show_progress_bar=True,\n",
+        "        convert_to_tensor=True,\n",
+        "        normalize_embeddings=True,\n",
+        "    )\n",
+        "\n",
+        "print(\"Indices and models ready.\")"
+      ],
+      "metadata": {
+        "id": "QkXoElmYlHGs"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "\n",
+        "BGE_PREFIX = \"Represent this sentence for searching relevant passages: \"\n",
+        "submission_rows = []\n",
+        "\n",
+        "for q_id, raw_q in zip(test_queries_df[query_id_col], test_queries_df[query_text_col].fillna(\"\").astype(str)):\n",
+        "    expanded_q = expand_agri_query(raw_q)\n",
+        "    hyde_passage = generate_hyde_doc(raw_q, expanded_q)\n",
+        "\n",
+        "    # Lexical\n",
+        "    bm25_scores = bm25_index.get_scores(expanded_q.lower().split())\n",
+        "    top_bm25 = np.argsort(bm25_scores)[::-1][:60]\n",
+        "\n",
+        "    # Dense (HyDE)\n",
+        "    q_emb = retriever.encode(BGE_PREFIX + hyde_passage, convert_to_tensor=True, normalize_embeddings=True)\n",
+        "    dense_scores = torch.matmul(doc_embeddings, q_emb).cpu().numpy()\n",
+        "    top_dense = np.argsort(dense_scores)[::-1][:60]\n",
+        "\n",
+        "    # RRF\n",
+        "    rrf = {}\n",
+        "    for rank, idx in enumerate(top_bm25):\n",
+        "        rrf[idx] = rrf.get(idx, 0.0) + 1.0 / (60 + rank + 1)\n",
+        "    for rank, idx in enumerate(top_dense):\n",
+        "        rrf[idx] = rrf.get(idx, 0.0) + 1.0 / (60 + rank + 1)\n",
+        "    candidates = sorted(rrf, key=rrf.get, reverse=True)[:30]\n",
+        "\n",
+        "    # Dual rerank\n",
+        "    pairs = [[raw_q, doc_texts[i]] for i in candidates]\n",
+        "    with torch.autocast(device_type=device, dtype=torch.float16 if device == \"cuda\" else torch.float32):\n",
+        "        s_bge = reranker_bge.predict(pairs, batch_size=32, show_progress_bar=False)\n",
+        "        s_mxbai = reranker_mxbai.predict(pairs, batch_size=32, show_progress_bar=False)\n",
+        "\n",
+        "    norm_bge = (s_bge - s_bge.min()) / (np.ptp(s_bge) + 1e-8)\n",
+        "    norm_mxbai = (s_mxbai - s_mxbai.min()) / (np.ptp(s_mxbai) + 1e-8)\n",
+        "    ensemble = 0.5 * norm_bge + 0.5 * norm_mxbai\n",
+        "\n",
+        "    top10 = [candidates[i] for i in np.argsort(ensemble)[::-1][:10]]\n",
+        "    for doc_idx in top10:\n",
+        "        submission_rows.append({\n",
+        "            \"QueryId\": q_id,\n",
+        "            \"DocumentId\": documents_df.iloc[doc_idx][doc_id_col]\n",
+        "        })\n",
+        "\n",
+        "print(f\"Done. Generated {len(submission_rows)} rows.\")"
+      ],
+      "metadata": {
+        "id": "t77Uq79YlTl7"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "\n",
+        "# Lexical index\n",
+        "tokenized_corpus = [doc.lower().split() for doc in doc_texts]\n",
+        "bm25_index = BM25Okapi(tokenized_corpus)\n",
+        "\n",
+        "# Dense retriever + rerankers\n",
+        "retriever = SentenceTransformer(\"BAAI/bge-large-en-v1.5\", device=device)\n",
+        "reranker_bge = CrossEncoder(\"BAAI/bge-reranker-v2-m3\", device=device)\n",
+        "reranker_mxbai = CrossEncoder(\"mixedbread-ai/mxbai-rerank-large-v1\", device=device)\n",
+        "\n",
+        "# Document embeddings\n",
+        "with torch.autocast(device_type=device, dtype=torch.float16 if device == \"cuda\" else torch.float32):\n",
+        "    doc_embeddings = retriever.encode(\n",
+        "        doc_texts,\n",
+        "        batch_size=32 if device == \"cuda\" else 16,\n",
+        "        show_progress_bar=True,\n",
+        "        convert_to_tensor=True,\n",
+        "        normalize_embeddings=True,\n",
+        "    )\n",
+        "\n",
+        "print(\"Indices and models ready.\")"
+      ],
+      "metadata": {
+        "id": "50Z6ID4hlZH8"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [
+        "\n",
+        "BGE_PREFIX = \"Represent this sentence for searching relevant passages: \"\n",
+        "submission_rows = []\n",
+        "\n",
+        "for q_id, raw_q in zip(test_queries_df[query_id_col], test_queries_df[query_text_col].fillna(\"\").astype(str)):\n",
+        "    expanded_q = expand_agri_query(raw_q)\n",
+        "    hyde_passage = generate_hyde_doc(raw_q, expanded_q)\n",
+        "\n",
+        "    # Lexical\n",
+        "    bm25_scores = bm25_index.get_scores(expanded_q.lower().split())\n",
+        "    top_bm25 = np.argsort(bm25_scores)[::-1][:60]\n",
+        "\n",
+        "    # Dense (HyDE)\n",
+        "    q_emb = retriever.encode(BGE_PREFIX + hyde_passage, convert_to_tensor=True, normalize_embeddings=True)\n",
+        "    dense_scores = torch.matmul(doc_embeddings, q_emb).cpu().numpy()\n",
+        "    top_dense = np.argsort(dense_scores)[::-1][:60]\n",
+        "\n",
+        "    # RRF\n",
+        "    rrf = {}\n",
+        "    for rank, idx in enumerate(top_bm25):\n",
+        "        rrf[idx] = rrf.get(idx, 0.0) + 1.0 / (60 + rank + 1)\n",
+        "    for rank, idx in enumerate(top_dense):\n",
+        "        rrf[idx] = rrf.get(idx, 0.0) + 1.0 / (60 + rank + 1)\n",
+        "    candidates = sorted(rrf, key=rrf.get, reverse=True)[:30]\n",
+        "\n",
+        "    # Dual rerank\n",
+        "    pairs = [[raw_q, doc_texts[i]] for i in candidates]\n",
+        "    with torch.autocast(device_type=device, dtype=torch.float16 if device == \"cuda\" else torch.float32):\n",
+        "        s_bge = reranker_bge.predict(pairs, batch_size=32, show_progress_bar=False)\n",
+        "        s_mxbai = reranker_mxbai.predict(pairs, batch_size=32, show_progress_bar=False)\n",
+        "\n",
+        "    norm_bge = (s_bge - s_bge.min()) / (np.ptp(s_bge) + 1e-8)\n",
+        "    norm_mxbai = (s_mxbai - s_mxbai.min()) / (np.ptp(s_mxbai) + 1e-8)\n",
+        "    ensemble = 0.5 * norm_bge + 0.5 * norm_mxbai\n",
+        "\n",
+        "    top10 = [candidates[i] for i in np.argsort(ensemble)[::-1][:10]]\n",
+        "    for doc_idx in top10:\n",
+        "        submission_rows.append({\n",
+        "            \"QueryId\": q_id,\n",
+        "            \"DocumentId\": documents_df.iloc[doc_idx][doc_id_col]\n",
+        "        })\n",
+        "\n",
+        "print(f\"Done. Generated {len(submission_rows)} rows.\")"
+      ],
+      "metadata": {
+        "id": "ym2Lx2tXl_KU"
+      },
+      "execution_count": null,
+      "outputs": []
+    },
+    {
+      "cell_type": "code",
+      "source": [],
+      "metadata": {
+        "id": "roIqVxxVmBQh"
+      },
+      "execution_count": null,
+      "outputs": []
+    }
+  ]
+}
